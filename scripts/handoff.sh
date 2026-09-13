@@ -1,58 +1,59 @@
 #!/bin/bash
 # ---------------------------------------------------------------------------
-# codex-quota-window-resume
+# codex-quota-handoff —— 额度窗口接力
 #
-# 在 Codex 额度窗口重置后，自动把续跑指令投喂给被中断的线程。
+# Codex 撞到用量上限被打断后，在窗口刷新的那一刻自动把续跑指令投喂回原线程。
+# 无人值守。触发源可以是系统定时器，也可以是另一个 agent。
 #
 # 用法：
-#   export CODEX_THREAD="<线程UUID>"
-#   export CODEX_WORKDIR="/path/to/thread/cwd"
-#   export CODEX_RESUME_RESET_EPOCH=1735689600     # 窗口重置的 Unix 秒
-#   export CODEX_RESUME_TARGET_DATE=2026-09-14     # 可选，默认今天
-#   export CODEX_RESUME_DRY_RUN=1                  # 先干跑验证
-#   ./run-resume.sh
+#   export CODEX_HANDOFF_THREAD="<线程UUID>"
+#   export CODEX_HANDOFF_WORKDIR="/path/to/thread/cwd"
+#   export CODEX_HANDOFF_RESET_EPOCH=1735689600    # 窗口刷新的 Unix 秒
+#   export CODEX_HANDOFF_DRY_RUN=1                 # 先干跑验证
+#   ./handoff.sh
 #
-# 依赖：jq 不需要；sqlite3 / git 可选。
+# 完整说明见 README.md
 # ---------------------------------------------------------------------------
 
 set -uo pipefail
 
 # =========================== 配置 ===========================
 
-# Codex Desktop 内置 CLI。注意：不是 brew 装的那个（那个往往是坏的）。
+# Codex 的 CLI 二进制。默认取 Codex Desktop 内置那个。
+# 注意：不要用 brew 装的那个（往往是坏的）。
 CODEX="${CODEX_BIN:-/Applications/ChatGPT.app/Contents/Resources/codex}"
 
-# 要续跑的线程 UUID。必填。
-THREAD="${CODEX_THREAD:-}"
+# 要接力的线程 UUID。必填。
+THREAD="${CODEX_HANDOFF_THREAD:-}"
 
-# 线程原始工作目录（= threads 表里的 cwd）。也是 Codex 的受信任目录。
-WORKDIR="${CODEX_WORKDIR:-$HOME}"
+# 线程的工作目录（= threads 表里的 cwd）。也是 Codex 的受信任目录。
+WORKDIR="${CODEX_HANDOFF_WORKDIR:-$HOME}"
 
-# 可选：实际代码仓库路径。仅用于前置检查时多看一眼，不影响投喂。
-CODE_REPO="${CODEX_CODE_REPO:-}"
+# 可选：真实代码仓库路径。只用于日志里多看一眼，不影响投喂。
+CODE_REPO="${CODEX_HANDOFF_CODE_REPO:-}"
 
 # 模型与推理档位
-MODEL="${CODEX_MODEL:-gpt-5.6-sol}"
-EFFORT="${CODEX_EFFORT:-ultra}"
+MODEL="${CODEX_HANDOFF_MODEL:-gpt-5.6-sol}"
+EFFORT="${CODEX_HANDOFF_EFFORT:-ultra}"
 
 # 运行目录（日志、指令、标记都放这儿）
-BASE="${CODEX_RESUME_BASE:-$HOME/.codex-resume}"
-MSGFILE="${CODEX_RESUME_MSG:-$BASE/message.txt}"
+BASE="${CODEX_HANDOFF_BASE:-$HOME/.codex-handoff}"
+PROMPTFILE="${CODEX_HANDOFF_PROMPT:-$BASE/prompt.txt}"
 
 # 一次性守卫：默认只对「今天」生效
-TARGET_DATE="${CODEX_RESUME_TARGET_DATE:-$(date +%F)}"
+TARGET_DATE="${CODEX_HANDOFF_DATE:-$(date +%F)}"
 
-# 额度窗口重置的 Unix 秒。必填（留 0 会立刻执行）。
-RESET_EPOCH="${CODEX_RESUME_RESET_EPOCH:-0}"
+# 额度窗口刷新的 Unix 秒。必填（留 0 会立刻执行）。
+RESET_EPOCH="${CODEX_HANDOFF_RESET_EPOCH:-0}"
 
-# 重置点之后再多等几秒，避开边界抖动
-GRACE="${CODEX_RESUME_GRACE:-25}"
+# 刷新点之后再多等几秒，避开边界抖动
+GRACE="${CODEX_HANDOFF_GRACE:-25}"
 
 # 1 = 只打印将要执行的命令，不真跑
-DRY_RUN="${CODEX_RESUME_DRY_RUN:-0}"
+DRY_RUN="${CODEX_HANDOFF_DRY_RUN:-0}"
 
 # 重试间隔（秒）
-RETRY_WAIT="${CODEX_RESUME_RETRY_WAIT:-60}"
+RETRY_WAIT="${CODEX_HANDOFF_RETRY_WAIT:-60}"
 
 DONE_MARKER="$BASE/.done-$TARGET_DATE"
 ATTEMPT_MARKER="$BASE/.attempted-$TARGET_DATE"
@@ -63,32 +64,33 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 # =========================== 日志 ===========================
 mkdir -p "$BASE/logs" || exit 1
 STAMP=$(date +%Y%m%d-%H%M%S)
-LOG="$BASE/logs/run-$STAMP.log"
+LOG="$BASE/logs/handoff-$STAMP.log"
 LASTMSG="$BASE/logs/last-message-$STAMP.txt"
 exec >>"$LOG" 2>&1
 
 echo "=================================================="
-echo "codex-quota-window-resume"
+echo "codex-quota-handoff"
 echo "启动时间 : $(date '+%Y-%m-%d %H:%M:%S')"
 echo "日志文件 : $LOG"
 
 # =========================== 参数校验 ===========================
 FAIL=0
-[ -n "$THREAD" ]  || { echo "FAIL: 未设置 CODEX_THREAD（线程 UUID）"; FAIL=1; }
-[ "$RESET_EPOCH" -gt 0 ] 2>/dev/null || { echo "FAIL: 未设置 CODEX_RESUME_RESET_EPOCH（额度重置 Unix 秒）"; FAIL=1; }
+[ -n "$THREAD" ]  || { echo "FAIL: 未设置 CODEX_HANDOFF_THREAD（线程 UUID）"; FAIL=1; }
+[ "$RESET_EPOCH" -gt 0 ] 2>/dev/null || { echo "FAIL: 未设置 CODEX_HANDOFF_RESET_EPOCH（窗口刷新 Unix 秒）"; FAIL=1; }
 [ -x "$CODEX" ]   || { echo "FAIL: Codex CLI 不可执行 -> $CODEX"; FAIL=1; }
 [ -d "$WORKDIR" ] || { echo "FAIL: 工作目录不存在 -> $WORKDIR"; FAIL=1; }
-[ -s "$MSGFILE" ] || { echo "FAIL: 续跑指令为空 -> $MSGFILE"; FAIL=1; }
+[ -s "$PROMPTFILE" ] || { echo "FAIL: 接力指令为空 -> $PROMPTFILE"; FAIL=1; }
 [ "$FAIL" -eq 0 ] || { echo "参数校验未通过，放弃。"; exit 1; }
 
 echo "线程 UUID : $THREAD"
 echo "工作目录  : $WORKDIR"
 echo "模型      : $MODEL / $EFFORT"
 [ -n "$CODE_REPO" ] && echo "代码仓库  : $CODE_REPO"
-echo "重置时间  : $(date -r "$RESET_EPOCH" '+%Y-%m-%d %H:%M:%S')"
+echo "刷新时间  : $(date -r "$RESET_EPOCH" '+%Y-%m-%d %H:%M:%S')"
 
 # =========================== 一次性守卫 ===========================
-# 注意：变量后面紧跟中文标点时一律写 ${VAR}，否则 bash 会把中文吞进变量名。
+# 注意：变量后面紧跟中文标点时一律写 ${VAR}，
+# 否则 bash 在 UTF-8 locale 下会把中文字节吞进变量名，报 unbound variable。
 TODAY=$(date +%F)
 if [ "${TODAY}" != "${TARGET_DATE}" ]; then
   echo "跳过：今天 ${TODAY}，非目标日期 ${TARGET_DATE}"
@@ -110,23 +112,23 @@ if ! mkdir "${LOCKDIR}" 2>/dev/null; then
 fi
 trap 'rmdir "${LOCKDIR}" 2>/dev/null' EXIT INT TERM
 
-# =========================== 等额度窗口重置 ===========================
+# =========================== 等额度窗口刷新 ===========================
 WAIT_UNTIL=$((RESET_EPOCH + GRACE))
 if [ "$(date +%s)" -lt "${WAIT_UNTIL}" ]; then
   echo "当前 $(date '+%H:%M:%S')，等待至 $(date -r "${WAIT_UNTIL}" '+%H:%M:%S') ..."
   while [ "$(date +%s)" -lt "${WAIT_UNTIL}" ]; do sleep 15; done
 fi
-echo "已过重置点，开始执行：$(date '+%H:%M:%S')"
+echo "已过刷新点，开始执行：$(date '+%H:%M:%S')"
 
-PROMPT=$(cat "$MSGFILE")
+PROMPT=$(cat "$PROMPTFILE")
 
 # =========================== 干跑 ===========================
 if [ "${DRY_RUN}" = "1" ]; then
   echo "===== DRY RUN：只打印，不实际调用 Codex ====="
-  echo "指令字节数 : $(wc -c < "$MSGFILE" | tr -d ' ')"
+  echo "指令字节数 : $(wc -c < "$PROMPTFILE" | tr -d ' ')"
   echo "输出文件   : ${LASTMSG}"
   echo "----- 指令全文 -----"
-  cat "$MSGFILE"
+  cat "$PROMPTFILE"
   echo "----- 指令结束 -----"
   exit 0
 fi
@@ -135,6 +137,7 @@ cd "$WORKDIR" || { echo "FAIL: 无法进入工作目录"; exit 1; }
 
 # =========================== 主执行 ===========================
 # 重要：--approve-for-me 和 -C 是 exec 级参数，必须写在 resume【之前】。
+# 写在后面会被 clap 判为 unexpected argument。
 run_once () {
   echo "---------- 尝试 #$1 $(date '+%H:%M:%S') ----------"
   caffeinate -i -s "$CODEX" exec \
@@ -147,6 +150,7 @@ run_once () {
   return $?
 }
 
+# 记下"已尝试"，避免另一个触发源在后面又投一次同样的指令
 touch "${ATTEMPT_MARKER}"
 
 run_once 1

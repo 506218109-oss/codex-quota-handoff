@@ -3,15 +3,15 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.YOURNAME.codex-resume</string>
+    <string>com.YOURNAME.codex-quota-handoff</string>
 
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>__HOME__/.codex-resume/run-resume.sh</string>
+        <string>__HOME__/.codex-handoff/handoff.sh</string>
     </array>
 
-    <!-- 改成你的额度窗口重置时间之后 1 分钟 -->
+    <!-- 改成你的额度窗口刷新时刻之后 1 分钟 -->
     <key>StartCalendarInterval</key>
     <dict>
         <key>Hour</key>
@@ -29,13 +29,11 @@
         <string>__HOME__</string>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-        <key>LANG</key>
-        <string>en_US.UTF-8</string>
+        <!-- 此处按需注入接力参数，避免依赖登录 shell 的环境
+        <key>CODEX_HANDOFF_THREAD</key><string>xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx</string>
+        <key>CODEX_HANDOFF_WORKDIR</key><string>/path/to/thread/cwd</string>
+        <key>CODEX_HANDOFF_RESET_EPOCH</key><string>1735689600</string>
+        -->
     </dict>
-
-    <key>StandardOutPath</key>
-    <string>__HOME__/.codex-resume/logs/launchd.out.log</string>
-    <key>StandardErrorPath</key>
-    <string>__HOME__/.codex-resume/logs/launchd.err.log</string>
 </dict>
 </plist>
