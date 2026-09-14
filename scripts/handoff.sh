@@ -100,9 +100,15 @@ if [ -f "${DONE_MARKER}" ]; then
   echo "跳过：本日已成功执行过（${DONE_MARKER} 存在）"
   exit 0
 fi
+# 这里【故意不拦截】ATTEMPT_MARKER。
+# 实战教训：.attempted 若在调用前落盘并参与拦截，一条路径失败（例如 launchd 缺权限）
+# 会把另一条本来能成功的路径挡在门外 —— 一次失败导致当天彻底没机会重试。
+# 职责划分：
+#   · 防"同时开火"   -> 下面的 .lock 互斥
+#   · 防"当天重复跑" -> 上面的 .done（只在成功时写）
+#   · .attempted      -> 仅诊断面包屑，不参与拦截
 if [ -f "${ATTEMPT_MARKER}" ]; then
-  echo "跳过：本日已尝试过（${ATTEMPT_MARKER} 存在），不重复投喂"
-  exit 0
+  echo "提示：本日已有过一次尝试（${ATTEMPT_MARKER} 存在）但未成功，本次继续投喂。"
 fi
 
 # =========================== 互斥锁 ===========================
@@ -136,39 +142,58 @@ fi
 cd "$WORKDIR" || { echo "FAIL: 无法进入工作目录"; exit 1; }
 
 # =========================== 主执行 ===========================
-# 重要：--approve-for-me 和 -C 是 exec 级参数，必须写在 resume【之前】。
-# 写在后面会被 clap 判为 unexpected argument。
+# 重要一：--approve-for-me 和 -C 是 exec 级参数，必须写在 resume【之前】。
+#         写在后面会被 clap 判为 unexpected argument。
+# 重要二：线程如果正被 Codex Desktop 打开着，它持有该线程的写锁，外部 exec resume 必然失败：
+#             thread-store conflict: thread <id> already has an active writer
+#         这时必须改用 `codex queue` —— 它把消息交给持有线程的 app-server 执行，不抢锁。
+#         代价：queue 拿不到执行输出（日志里只有"已入队"的确认，实际结果在 Codex 界面里）。
+
+ACTIVE_WRITER=0
+
 run_once () {
   echo "---------- 尝试 #$1 $(date '+%H:%M:%S') ----------"
-  caffeinate -i -s "$CODEX" exec \
+  local out
+  out=$(caffeinate -i -s "$CODEX" exec \
     --approve-for-me \
     -C "$WORKDIR" \
     resume "$THREAD" "$PROMPT" \
     -m "$MODEL" \
     -c "model_reasoning_effort=\"${EFFORT}\"" \
-    -o "$LASTMSG"
-  return $?
+    -o "$LASTMSG" 2>&1)
+  local rc=$?
+  echo "$out"
+  case "$out" in
+    *"already has an active writer"*) ACTIVE_WRITER=1 ;;
+  esac
+  return $rc
 }
 
-# 记下"已尝试"，避免另一个触发源在后面又投一次同样的指令
+# 记下"已尝试"，作为诊断面包屑（不参与拦截）
 touch "${ATTEMPT_MARKER}"
 
 run_once 1
 RC=$?
 
-if [ "${RC}" -ne 0 ]; then
+# 命中写锁冲突时不重试 —— 重试一百次结果一样，直接走 queue
+if [ "${RC}" -ne 0 ] && [ "${ACTIVE_WRITER}" -eq 0 ]; then
   echo "第 1 次失败（退出码 ${RC}），${RETRY_WAIT} 秒后重试..."
   sleep "${RETRY_WAIT}"
   run_once 2
   RC=$?
 fi
 
-# =========================== 兜底 ===========================
+# =========================== 兜底：queue ===========================
 if [ "${RC}" -ne 0 ]; then
-  echo "exec resume 两次都失败，改用 queue 投喂（此方式拿不到执行输出）"
+  if [ "${ACTIVE_WRITER}" -eq 1 ]; then
+    echo "线程被 Codex Desktop 持有写锁，跳过重试，直接改用 queue（这是预期路径）。"
+  else
+    echo "exec resume 未成功，改用 queue 投喂。"
+  fi
+  echo "注意：queue 走 app-server，由持有线程的 Codex 界面执行，本脚本拿不到执行输出。"
   "$CODEX" queue --thread "$THREAD" --message "$PROMPT"
   RC=$?
-  [ "${RC}" -eq 0 ] && echo "queue 投喂成功，请到 Codex 界面查看该线程执行情况。"
+  [ "${RC}" -eq 0 ] && echo "queue 投喂成功（已入队即视为接力完成）。请到 Codex 界面查看执行情况。"
 fi
 
 # =========================== 收尾 ===========================

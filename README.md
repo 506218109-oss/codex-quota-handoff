@@ -132,6 +132,59 @@ error: unexpected argument '-C' found
 | `--approve-for-me` | 转自动复核模型 | **无人值守推荐** |
 | `--dangerously-bypass-approvals-and-sandbox` | 跳过一切，连沙箱都关 | 只读任务也没必要 |
 
+#### ⚠️ 陷阱二·关键：线程正被 Codex Desktop 打开时，`exec resume` 必然失败
+
+**这是整件事最容易踩、也最难猜的一个坑。**
+
+只要那个线程在 Codex 界面里是打开的（绝大多数情况都是），**它持有该线程的写锁**，
+外部进程抢不到：
+
+```
+ERROR codex_core::session::session: failed to initialize thread persistence:
+  thread-store conflict: thread <UUID> already has an active writer
+Error: thread/resume: thread/resume failed: thread <UUID> already has an active writer (code -32600)
+```
+
+这时候正确的工具是 **`queue`** —— 它把消息交给持有线程的 app-server 去执行，不抢锁：
+
+```bash
+"<codex binary>" queue --thread <UUID> --message "<续跑指令>"
+
+# 成功输出：
+# Queued message 01a09e57-3b79-70a1-90c2-e90afb215c31 for thread 01a09a89-...
+```
+
+**取舍**：
+
+| | `exec resume` | `queue` |
+|---|---|---|
+| 线程被界面打开时 | ✗ 写锁冲突 | ✓ 可用 |
+| 能拿到执行输出 | ✓ 完整 | ✗ 只有"已入队" |
+| 适合 | 线程已关闭 / 界面没开着 | 线程开着（默认情况）|
+
+因为拿不到输出，用 `queue` 时**验证结果要去读线程自己的 rollout JSONL**
+（`~/.codex/sessions/.../rollout-<线程UUID>.jsonl`，看文件是否在增长）。
+
+**所以脚本的正确策略是**：先试 `exec resume`，**一命中 `already has an active writer` 就立刻跳到 `queue`，不要重试** —— 重试一百次结果完全一样，只是白等。
+
+```bash
+ACTIVE_WRITER=0
+run_once () {
+  local out                                    # 注意：必须单独一行
+  out=$(caffeinate -i -s "$CODEX" exec --approve-for-me -C "$WORKDIR" \
+        resume "$THREAD" "$PROMPT" -m "$MODEL" -o "$LASTMSG" 2>&1)
+  local rc=$?
+  echo "$out"
+  case "$out" in *"already has an active writer"*) ACTIVE_WRITER=1 ;; esac
+  return $rc
+}
+```
+
+> ⚠️ `local out=$(...)` 这种写法会**吃掉退出码**（`$?` 变成 `local` 自己的状态）。
+> 必须写成 `local out` 然后另起一行赋值。
+
+**推论**：想让 `exec resume` 这条路可用，得先在 Codex 界面上关掉/归档该线程。
+
 #### ⚠️ 陷阱三：Codex 只认「受信任目录」
 
 ```
@@ -543,6 +596,62 @@ in the logs). Note this is **machine review**, not "no review."
 | (none) | Waits for a human click | Someone is watching |
 | `--approve-for-me` | Auto-review model decides | **Recommended unattended** |
 | `--dangerously-bypass-approvals-and-sandbox` | Skips everything, no sandbox | Unnecessary even for read-only work |
+
+#### ⚠️ Trap 2b — the big one: `exec resume` CANNOT work while the thread is open in Codex Desktop
+
+**This is the easiest trap to hit and the hardest to guess.**
+
+As long as that thread is open in the Codex UI (which is the normal case),
+**it holds a write lock on the thread** and no external process can take over:
+
+```
+ERROR codex_core::session::session: failed to initialize thread persistence:
+  thread-store conflict: thread <UUID> already has an active writer
+Error: thread/resume: thread/resume failed: thread <UUID> already has an active writer (code -32600)
+```
+
+The right tool here is **`queue`** — it hands the message to the app-server that
+already owns the thread, so there's no lock contention:
+
+```bash
+"<codex binary>" queue --thread <UUID> --message "<continuation prompt>"
+
+# success:
+# Queued message 01a09e57-3b79-70a1-90c2-e90afb215c31 for thread 01a09a89-...
+```
+
+**Trade-off**:
+
+| | `exec resume` | `queue` |
+|---|---|---|
+| Thread open in the UI | ✗ write-lock conflict | ✓ works |
+| Captures execution output | ✓ full | ✗ only "queued" |
+| Use when | thread is closed | thread is open (the default) |
+
+Since `queue` gives you no output, **verify by watching the thread's own rollout JSONL**
+(`~/.codex/sessions/.../rollout-<thread-uuid>.jsonl`) — check whether the file keeps growing.
+
+**So the correct script strategy is**: try `exec resume` first, and **the moment you see
+`already has an active writer`, jump straight to `queue` without retrying** — retrying
+produces the identical result, just 60 seconds slower.
+
+```bash
+ACTIVE_WRITER=0
+run_once () {
+  local out                                    # must be on its own line
+  out=$(caffeinate -i -s "$CODEX" exec --approve-for-me -C "$WORKDIR" \
+        resume "$THREAD" "$PROMPT" -m "$MODEL" -o "$LASTMSG" 2>&1)
+  local rc=$?
+  echo "$out"
+  case "$out" in *"already has an active writer"*) ACTIVE_WRITER=1 ;; esac
+  return $rc
+}
+```
+
+> ⚠️ `local out=$(...)` **swallows the exit code** (`$?` becomes `local`'s own status).
+> Write `local out` on one line and assign on the next.
+
+**Corollary**: to make `exec resume` usable, close or archive the thread in the Codex UI first.
 
 #### ⚠️ Trap 3: Codex only runs in "trusted directories"
 
