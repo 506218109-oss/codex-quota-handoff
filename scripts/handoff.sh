@@ -57,6 +57,8 @@ RETRY_WAIT="${CODEX_HANDOFF_RETRY_WAIT:-60}"
 
 DONE_MARKER="$BASE/.done-$TARGET_DATE"
 ATTEMPT_MARKER="$BASE/.attempted-$TARGET_DATE"
+QUEUED_MARKER="$BASE/.queued-$TARGET_DATE"
+USED_QUEUE=0
 LOCKDIR="$BASE/.lock"
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -97,7 +99,13 @@ if [ "${TODAY}" != "${TARGET_DATE}" ]; then
   exit 0
 fi
 if [ -f "${DONE_MARKER}" ]; then
-  echo "跳过：本日已成功执行过（${DONE_MARKER} 存在）"
+  echo "跳过：本日任务已执行过并拿到完整输出（${DONE_MARKER} 存在）"
+  exit 0
+fi
+if [ -f "${QUEUED_MARKER}" ]; then
+  echo "跳过：本日已通过 queue 投喂过（${QUEUED_MARKER} 存在），避免重复刷屏。"
+  echo "如需再次接力（例如上一轮又撞了额度），先删除该标记："
+  echo "  rm -f ${QUEUED_MARKER}"
   exit 0
 fi
 # 这里【故意不拦截】ATTEMPT_MARKER。
@@ -193,7 +201,10 @@ if [ "${RC}" -ne 0 ]; then
   echo "注意：queue 走 app-server，由持有线程的 Codex 界面执行，本脚本拿不到执行输出。"
   "$CODEX" queue --thread "$THREAD" --message "$PROMPT"
   RC=$?
-  [ "${RC}" -eq 0 ] && echo "queue 投喂成功（已入队即视为接力完成）。请到 Codex 界面查看执行情况。"
+  if [ "${RC}" -eq 0 ]; then
+    USED_QUEUE=1
+    echo "queue 投喂成功（已入队）。请到 Codex 界面查看执行情况。"
+  fi
 fi
 
 # =========================== 收尾 ===========================
@@ -205,8 +216,19 @@ if [ -f "${LASTMSG}" ]; then
 fi
 
 if [ "${RC}" -eq 0 ]; then
-  touch "${DONE_MARKER}"
-  echo "已标记完成：${DONE_MARKER}"
+  # 关键区分：queue 成功只代表"已入队"，不代表任务跑完了。
+  # 用不同标记，避免把"投喂成功"误判成"任务完成"。
+  # 实测：13:15 投喂成功 → 103 秒后又撞额度上限，任务其实没完成。
+  if [ "${USED_QUEUE}" = "1" ]; then
+    touch "${QUEUED_MARKER}"
+    echo "已标记【已投喂待确认】：${QUEUED_MARKER}"
+    echo "注意：这不代表任务完成 —— 请到 Codex 界面确认执行结果。"
+    echo "如需再次接力（例如又撞了额度），删掉标记即可："
+    echo "  rm -f ${QUEUED_MARKER} ${DONE_MARKER}"
+  else
+    touch "${DONE_MARKER}"
+    echo "已标记完成：${DONE_MARKER}"
+  fi
 fi
 
 exit "${RC}"

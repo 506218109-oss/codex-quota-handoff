@@ -185,6 +185,19 @@ run_once () {
 
 **推论**：想让 `exec resume` 这条路可用，得先在 Codex 界面上关掉/归档该线程。
 
+> ⚠️ **`queue` 成功 ≠ 任务完成。** `queue` 只保证消息进了队列，不代表模型把它跑完了。
+> 实测过一次：投喂成功后那一轮跑了 103 秒，**又撞上额度上限**被切断。
+> 所以这两件事要用不同的标记区分：
+>
+> | 路径 | 标记 | 含义 |
+> |---|---|---|
+> | `exec resume` 成功 | `.done-<日期>` | 拿到了完整输出，任务确实跑完 |
+> | `queue` 成功 | `.queued-<日期>` | **仅**已入队，是否完成需人工/二次确认 |
+>
+> **推论二**：额度窗口是账号级的，而且**一次接力就可能再撞一次上限**。
+> 如果你的 5 小时窗口在投喂时已经用了 85%，剩下的量可能只够跑一两分钟。
+> 续跑前先读一下 `used_percent`，别把宝贵的窗口浪费在一次注定被切断的尝试上。
+
 #### ⚠️ 陷阱三：Codex 只认「受信任目录」
 
 ```
@@ -652,6 +665,21 @@ run_once () {
 > Write `local out` on one line and assign on the next.
 
 **Corollary**: to make `exec resume` usable, close or archive the thread in the Codex UI first.
+
+> ⚠️ **`queue` succeeding does NOT mean the task finished.** It only guarantees the message
+> was enqueued — not that the model ran it to completion. We measured one case where the
+> resumed turn ran for 103 seconds and then **hit the usage limit again**.
+> So keep the two outcomes under different markers:
+>
+> | Path | Marker | Meaning |
+> |---|---|---|
+> | `exec resume` succeeded | `.done-<date>` | Full output captured; the task really completed |
+> | `queue` succeeded | `.queued-<date>` | **Only** enqueued; completion needs confirmation |
+>
+> **Corollary 2**: the quota window is account-level, and **one handoff can burn the rest of
+> a window**. If your 5-hour window is already 85% used when you feed, the remainder may last
+> only a minute or two. Read `used_percent` before you feed — don't spend a precious window
+> on an attempt that's destined to be cut off.
 
 #### ⚠️ Trap 3: Codex only runs in "trusted directories"
 
